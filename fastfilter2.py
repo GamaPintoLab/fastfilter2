@@ -2,7 +2,7 @@
 
 """
 fastfilter_pe.py - Paired-end FASTQ filtering for STAR
-Optimized version with batch writing and dry-run support.
+Optimized version with batch writing, dry-run, and total reads summary.
 """
 
 import argparse
@@ -67,7 +67,7 @@ def find_homopolymers(seq):
 # Sequence filter
 # ---------------------
 def filter_sequence(record):
-    seq = record.seq  # no str conversion
+    seq = record.seq
     qual = record.letter_annotations.get("phred_quality", [])
     avg_qual = sum(qual) / len(qual) if qual else 0
 
@@ -89,6 +89,7 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
     r1_tmp = output_dir / f"{pair_name}_R1_FILTERED.fastq"
     r2_tmp = output_dir / f"{pair_name}_R2_FILTERED.fastq"
 
+    total_reads = 0
     good_reads = 0
     r1_buffer = []
     r2_buffer = []
@@ -103,6 +104,7 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
                                position=position,
                                leave=True,
                                dynamic_ncols=True):
+            total_reads += 1
 
             keep1 = filter_sequence(rec1)
             keep2 = filter_sequence(rec2)
@@ -130,7 +132,7 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
         for tmp in [r1_tmp, r2_tmp]:
             subprocess.run(["gzip", "-f", str(tmp)])
 
-    return {"file": pair_name, "good_reads": good_reads}
+    return {"file": pair_name, "total_reads": total_reads, "good_reads": good_reads}
 
 # ---------------------
 # Main workflow
@@ -164,9 +166,10 @@ def main():
     # Write summary CSV
     summary_file = output_dir / "fastfilter_summary.csv"
     with open(summary_file, "w") as f:
-        f.write("file,good_reads\n")
+        f.write("file,total_reads,good_reads,pass_rate_pct\n")
         for r in results:
-            f.write(f"{r['file']},{r['good_reads']}\n")
+            rate = (r["good_reads"] / r["total_reads"] * 100) if r["total_reads"] > 0 else 0
+            f.write(f"{r['file']},{r['total_reads']},{r['good_reads']},{rate:.1f}\n")
 
     print(f"Filtering complete. Summary written to {summary_file}")
 
