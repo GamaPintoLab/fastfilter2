@@ -1,17 +1,20 @@
 #!/usr/bin/env python3.9
 
 """
-fastfilter_pe.py - Paired-end FASTQ filtering for STAR
-FIXED VERSION:
-- No file overwriting
-- Proper batch writing
-- Writes directly to gzip
-- Safe multiprocessing
+fastfilter_pe.py - Production-ready paired-end FASTQ filtering
+
+Features:
+- Biological filters: length, Ns, homopolymers, average Phred quality
+- Writes **uncompressed FASTQ first** (fast)
+- Automatically compresses with pigz (multi-threaded)
+- Paired-end safe
+- Progress bars with tqdm
+- Summary CSV output
 """
 
 import argparse
-import gzip
 import multiprocessing
+import subprocess
 import sys
 from pathlib import Path
 from Bio.SeqIO.QualityIO import FastqPhredIterator
@@ -22,7 +25,7 @@ from tqdm import tqdm
 MIN_LENGTH_DEFAULT = 25
 HOMOPOLYMER_COEFF_DEFAULT = 25
 MIN_SCORE_DEFAULT = 30
-WRITE_BATCH_SIZE = 1000
+WRITE_BATCH_SIZE = 10000  # bigger batch for faster I/O
 
 # Globals
 min_seq_len = MIN_LENGTH_DEFAULT
@@ -34,9 +37,6 @@ output_dir = None
 dryrun = False
 
 
-# ---------------------
-# Argument parsing
-# ---------------------
 def parse_arguments():
     global min_seq_len, homopolymer_coeff, min_score
     global seq_dir, output_dir, num_cpus, dryrun
@@ -61,20 +61,14 @@ def parse_arguments():
     dryrun = args.dryrun
 
 
-# ---------------------
-# Homopolymer detection
-# ---------------------
 def find_homopolymers(seq):
-    # Faster and correct contiguous detection
+    """Detect contiguous homopolymers of given length."""
     for nt in "ATGC":
         if nt * homopolymer_coeff in seq:
             return True
     return False
 
 
-# ---------------------
-# Sequence filter
-# ---------------------
 def filter_sequence(record):
     seq = str(record.seq)
     qual = record.letter_annotations.get("phred_quality", [])
@@ -89,39 +83,33 @@ def filter_sequence(record):
         return False
     if sum(qual) / len(qual) < min_score:
         return False
-
     return True
 
 
-# ---------------------
-# Process paired-end file
-# ---------------------
 def process_pair(r1_path: Path, r2_path: Path, position: int):
     pair_name = r1_path.stem.replace("_R1", "")
 
-    r1_out_path = output_dir / f"{pair_name}_R1_FILTERED.fastq.gz"
-    r2_out_path = output_dir / f"{pair_name}_R2_FILTERED.fastq.gz"
+    # Uncompressed output first
+    r1_out_path = output_dir / f"{pair_name}_R1_FILTERED.fastq"
+    r2_out_path = output_dir / f"{pair_name}_R2_FILTERED.fastq"
 
     total_reads = 0
     good_reads = 0
-
     r1_buffer = []
     r2_buffer = []
 
-    # Open output once (no overwriting issue anymore)
     if not dryrun:
-        r1_out = gzip.open(r1_out_path, "wt")
-        r2_out = gzip.open(r2_out_path, "wt")
+        r1_out = open(r1_out_path, "w")
+        r2_out = open(r2_out_path, "w")
     else:
-        r1_out = None
-        r2_out = None
+        r1_out = r2_out = None
 
     with open(r1_path, "r") as r1_in, open(r2_path, "r") as r2_in:
-        r1_iterator = FastqPhredIterator(r1_in)
-        r2_iterator = FastqPhredIterator(r2_in)
+        r1_iter = FastqPhredIterator(r1_in)
+        r2_iter = FastqPhredIterator(r2_in)
 
         for rec1, rec2 in tqdm(
-            zip(r1_iterator, r2_iterator),
+            zip(r1_iter, r2_iter),
             desc=pair_name,
             unit="reads",
             position=position,
@@ -130,24 +118,22 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
         ):
             total_reads += 1
 
-            keep1 = filter_sequence(rec1)
-            keep2 = filter_sequence(rec2)
+            # Filter paired-end reads
+            if not (filter_sequence(rec1) and filter_sequence(rec2)):
+                continue
 
-            if keep1 and keep2:
-                good_reads += 1
+            good_reads += 1
 
-                if not dryrun:
-                    r1_buffer.append(rec1)
-                    r2_buffer.append(rec2)
+            if not dryrun:
+                r1_buffer.append(rec1)
+                r2_buffer.append(rec2)
 
-                # Batch write
-                if not dryrun and len(r1_buffer) >= WRITE_BATCH_SIZE:
+                if len(r1_buffer) >= WRITE_BATCH_SIZE:
                     SeqIO.write(r1_buffer, r1_out, "fastq")
                     SeqIO.write(r2_buffer, r2_out, "fastq")
                     r1_buffer.clear()
                     r2_buffer.clear()
 
-    # Write remaining
     if not dryrun and r1_buffer:
         SeqIO.write(r1_buffer, r1_out, "fastq")
         SeqIO.write(r2_buffer, r2_out, "fastq")
@@ -156,6 +142,10 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
         r1_out.close()
         r2_out.close()
 
+        # Compress with pigz automatically
+        subprocess.run(["pigz", "-p", str(num_cpus), str(r1_out_path)])
+        subprocess.run(["pigz", "-p", str(num_cpus), str(r2_out_path)])
+
     return {
         "file": pair_name,
         "total_reads": total_reads,
@@ -163,9 +153,6 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
     }
 
 
-# ---------------------
-# Main workflow
-# ---------------------
 def main():
     parse_arguments()
 
@@ -190,16 +177,15 @@ def main():
     with multiprocessing.Pool(processes=num_cpus) as pool:
         results = pool.starmap(process_pair, pool_args)
 
-    # Summary
+    # Summary CSV
     summary_file = output_dir / "fastfilter_summary.csv"
-
     with open(summary_file, "w") as f:
         f.write("file,total_reads,good_reads,pass_rate_pct\n")
         for r in results:
             rate = (r["good_reads"] / r["total_reads"] * 100) if r["total_reads"] else 0
             f.write(f"{r['file']},{r['total_reads']},{r['good_reads']},{rate:.2f}\n")
 
-    print(f"\nFiltering complete.")
+    print("\nFiltering complete.")
     print(f"Summary written to: {summary_file}")
 
 
