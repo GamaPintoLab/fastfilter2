@@ -2,12 +2,7 @@
 
 """
 fastfilter_pe.py - Paired-end FASTQ filtering for STAR
-Author: Updated for speed with final compression
-
-Changes:
-- Writes plain FASTQ during filtering (faster than streaming gzip)
-- Compresses outputs after filtering
-- Fixed tqdm progress bars to stack properly in multiprocessing
+Optimized version with batch writing and dry-run support.
 """
 
 import argparse
@@ -24,6 +19,7 @@ import subprocess
 MIN_LENGTH_DEFAULT = 25
 HOMOPOLYMER_COEFF_DEFAULT = 25
 MIN_SCORE_DEFAULT = 30
+WRITE_BATCH_SIZE = 1000  # number of reads to write at once
 
 # Globals
 min_seq_len = MIN_LENGTH_DEFAULT
@@ -32,12 +28,13 @@ min_score = MIN_SCORE_DEFAULT
 num_cpus = 1
 seq_dir = None
 output_dir = None
+dryrun = False
 
 # ---------------------
 # Argument parsing
 # ---------------------
 def parse_arguments():
-    global min_seq_len, homopolymer_coeff, min_score, seq_dir, output_dir, num_cpus
+    global min_seq_len, homopolymer_coeff, min_score, seq_dir, output_dir, num_cpus, dryrun
 
     parser = argparse.ArgumentParser(description="Paired-end FASTQ filtering for STAR.")
     parser.add_argument("-l", "--minlen", type=int, default=MIN_LENGTH_DEFAULT,
@@ -49,6 +46,7 @@ def parse_arguments():
     parser.add_argument("-i", "--seq-dir", type=str, help="Input directory containing cutadapt FASTQ files")
     parser.add_argument("-o", "--output-dir", type=str, help="Directory to save filtered FASTQ files")
     parser.add_argument("-j", "--cpus", type=int, default=1, help="Number of parallel CPUs")
+    parser.add_argument("--dryrun", action="store_true", help="Do not write output files, only simulate filtering")
 
     args = parser.parse_args()
     min_seq_len = args.minlen
@@ -57,6 +55,7 @@ def parse_arguments():
     seq_dir = Path(args.seq_dir) if args.seq_dir else None
     output_dir = Path(args.output_dir) if args.output_dir else None
     num_cpus = args.cpus
+    dryrun = args.dryrun
 
 # ---------------------
 # Homopolymer detection
@@ -68,7 +67,7 @@ def find_homopolymers(seq):
 # Sequence filter
 # ---------------------
 def filter_sequence(record):
-    seq = str(record.seq)
+    seq = record.seq  # no str conversion
     qual = record.letter_annotations.get("phred_quality", [])
     avg_qual = sum(qual) / len(qual) if qual else 0
 
@@ -91,30 +90,45 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
     r2_tmp = output_dir / f"{pair_name}_R2_FILTERED.fastq"
 
     good_reads = 0
+    r1_buffer = []
+    r2_buffer = []
 
-    with open(r1_path, "r") as r1_in, open(r2_path, "r") as r2_in, \
-         open(r1_tmp, "w") as r1_out, open(r2_tmp, "w") as r2_out:
-
+    with open(r1_path, "r") as r1_in, open(r2_path, "r") as r2_in:
         r1_iterator = FastqPhredIterator(r1_in)
         r2_iterator = FastqPhredIterator(r2_in)
 
-        # Use tqdm with position for stacked bars in multiprocessing
         for rec1, rec2 in tqdm(zip(r1_iterator, r2_iterator),
                                desc=f"{pair_name}",
                                unit="reads",
                                position=position,
                                leave=True,
                                dynamic_ncols=True):
+
             keep1 = filter_sequence(rec1)
             keep2 = filter_sequence(rec2)
-            if keep1 and keep2:
-                SeqIO.write(rec1, r1_out, "fastq")
-                SeqIO.write(rec2, r2_out, "fastq")
-                good_reads += 1
 
-    # Compress files at the end (much faster)
-    for tmp in [r1_tmp, r2_tmp]:
-        subprocess.run(["gzip", "-f", str(tmp)])
+            if keep1 and keep2:
+                good_reads += 1
+                if not dryrun:
+                    r1_buffer.append(rec1)
+                    r2_buffer.append(rec2)
+
+            # Write in batches
+            if not dryrun and len(r1_buffer) >= WRITE_BATCH_SIZE:
+                SeqIO.write(r1_buffer, r1_tmp, "fastq") if r1_buffer else None
+                SeqIO.write(r2_buffer, r2_tmp, "fastq") if r2_buffer else None
+                r1_buffer.clear()
+                r2_buffer.clear()
+
+    # Write remaining reads
+    if not dryrun and r1_buffer:
+        SeqIO.write(r1_buffer, r1_tmp, "fastq")
+        SeqIO.write(r2_buffer, r2_tmp, "fastq")
+
+    # Compress files at the end
+    if not dryrun:
+        for tmp in [r1_tmp, r2_tmp]:
+            subprocess.run(["gzip", "-f", str(tmp)])
 
     return {"file": pair_name, "good_reads": good_reads}
 
