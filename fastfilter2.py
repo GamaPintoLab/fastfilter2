@@ -136,6 +136,7 @@ def main():
     parser.add_argument("-o","--output-dir", type=str)
     parser.add_argument("-j","--threads", type=int, default=1)
     parser.add_argument("-d","--dryrun", action="store_true")
+    parser.add_argument("--chunk-size", type=int, default=100_000, help="Reads per batch for threading")
     args = parser.parse_args()
 
     seq_dir = Path(args.sequences_dir)
