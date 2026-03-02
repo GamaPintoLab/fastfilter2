@@ -98,6 +98,7 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
         open_func = open
         mode = "r"
 
+    total_lines = 0
     with open_func(r1_path, mode) as f:
         for _ in tqdm(f, desc=f"{pair_name} counting reads", unit="lines", position=position, leave=True, dynamic_ncols=True):
             total_lines += 1
