@@ -97,7 +97,7 @@ python FastFilter2.py -i /data/project/cutadapt -o /data/project/fastfilter -l 3
 
 ## **References**
 
-- FastFilter original implementation: [FastFilter v1 README](#)  
+- FastFilter original implementation: [fastfilter README](https://github.com/GamaPintoLab/fastfilter/blob/main/README.md)
 - STAR aligner: https://github.com/alexdobin/STAR  
 
 ---
