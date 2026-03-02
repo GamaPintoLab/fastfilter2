@@ -1,158 +1,154 @@
 #!/usr/bin/env python3.9
+
+"""
+fastfilter_pe.py - Paired-end FASTQ filtering for STAR
+Author: Updated for paired-end filtering
+
+Filters paired-end FASTQ files:
+- Removes sequences that are too short, contain Ns, dots, or long homopolymers.
+- Applies min average quality filter.
+- Writes filtered R1 and R2 reads to FASTQ.GZ outputs for STAR alignment.
+- Generates a summary CSV with total vs good reads.
+"""
+
 import argparse
 import gzip
 import multiprocessing
-from pathlib import Path
+import sys
 import time
-from Bio import SeqIO
-from Bio.SeqIO.QualityIO import FastqPhredIterator
-import csv
+from pathlib import Path
 
-# -------------------- Defaults -------------------- #
+from Bio.SeqIO.QualityIO import FastqPhredIterator
+from Bio import SeqIO
+from tqdm import tqdm
+
+# Defaults
 MIN_LENGTH_DEFAULT = 25
 HOMOPOLYMER_COEFF_DEFAULT = 25
 MIN_SCORE_DEFAULT = 30
+PROJECTS_DIR_DEFAULT = Path("/data/working_directory/projects")
 
-# -------------------- Globals -------------------- #
+# Globals
 min_seq_len = MIN_LENGTH_DEFAULT
 homopolymer_coeff = HOMOPOLYMER_COEFF_DEFAULT
 min_score = MIN_SCORE_DEFAULT
+num_cpus = 1
 seq_dir = None
 output_dir = None
-dryrun = False
 
+# ---------------------
+# Argument parsing
+# ---------------------
+def parse_arguments():
+    global min_seq_len, homopolymer_coeff, min_score, seq_dir, output_dir, num_cpus
 
-# -------------------- Utilities -------------------- #
-def find_homopolymers(seq: str) -> dict:
-    """Return dict indicating if sequence contains homopolymers of length homopolymer_coeff"""
-    return {
-        "A": int("A" * homopolymer_coeff in seq),
-        "T": int("T" * homopolymer_coeff in seq),
-        "G": int("G" * homopolymer_coeff in seq),
-        "C": int("C" * homopolymer_coeff in seq),
-    }
+    parser = argparse.ArgumentParser(description="Paired-end FASTQ filtering for STAR.")
+    parser.add_argument("-l", "--minlen", type=int, default=MIN_LENGTH_DEFAULT,
+                        help="Minimum sequence length")
+    parser.add_argument("-p", "--homopolymerlen", type=int, default=HOMOPOLYMER_COEFF_DEFAULT,
+                        help="Length threshold for homopolymers")
+    parser.add_argument("-s", "--min-score", type=int, default=MIN_SCORE_DEFAULT,
+                        help="Minimum average Phred quality score")
+    parser.add_argument("-i", "--seq-dir", type=str, help="Input directory containing cutadapt FASTQ files")
+    parser.add_argument("-o", "--output-dir", type=str, help="Directory to save filtered FASTQ.gz files")
+    parser.add_argument("-j", "--cpus", type=int, default=1, help="Number of parallel CPUs")
 
+    args = parser.parse_args()
+    min_seq_len = args.minlen
+    homopolymer_coeff = args.homopolymerlen
+    min_score = args.min_score
+    seq_dir = Path(args.seq_dir) if args.seq_dir else None
+    output_dir = Path(args.output_dir) if args.output_dir else None
+    num_cpus = args.cpus
 
-def analyze_sequence(record):
-    """Analyze sequence and return pass/fail and exclusion reasons"""
-    qual_values = record.letter_annotations.get("phred_quality", [])
-    qual_score = sum(qual_values)/len(qual_values) if qual_values else 0
+# ---------------------
+# Homopolymer detection
+# ---------------------
+def find_homopolymers(seq):
+    return any(seq.count(nt * homopolymer_coeff) > 0 for nt in "ATGC")
+
+# ---------------------
+# Sequence filter
+# ---------------------
+def filter_sequence(record):
     seq = str(record.seq)
-    homopolymers = find_homopolymers(seq)
-    homopolymer_exist = any(homopolymers.values())
-    n_count = seq.count("N")
-    dot_count = seq.count(".")
+    qual = record.letter_annotations.get("phred_quality", [])
+    avg_qual = sum(qual) / len(qual) if qual else 0
 
-    meets_criteria = (
-        len(seq) >= min_seq_len and
-        n_count == 0 and
-        dot_count == 0 and
-        not homopolymer_exist and
-        qual_score >= min_score
-    )
+    if len(seq) < min_seq_len:
+        return False
+    if "N" in seq or "." in seq:
+        return False
+    if find_homopolymers(seq):
+        return False
+    if avg_qual < min_score:
+        return False
+    return True
 
-    exclusion_reasons = {
-        "too_short": len(seq) < min_seq_len,
-        "found_n": n_count > 0,
-        "found_dot": dot_count > 0,
-        "found_homopolymer": homopolymer_exist,
-        "low_score": qual_score < min_score
-    }
-
-    return meets_criteria, exclusion_reasons
-
-
-# -------------------- Paired-end parser -------------------- #
-def parse_paired_file(r1_path: Path, r2_path: Path):
-    """Parse a pair of R1/R2 FASTQ files, write filtered .fastq.gz, return stats"""
-    base_name = r1_path.stem.replace("_R1", "")
-    out_r1 = output_dir / f"{r1_path.stem}_FILTERED.fastq.gz"
-    out_r2 = output_dir / f"{r2_path.stem}_FILTERED.fastq.gz"
+# ---------------------
+# Process paired-end file
+# ---------------------
+def process_pair(r1_path: Path, r2_path: Path):
+    pair_name = r1_path.stem.replace("_R1", "")
+    r1_out_path = output_dir / f"{pair_name}_R1_FILTERED.fastq.gz"
+    r2_out_path = output_dir / f"{pair_name}_R2_FILTERED.fastq.gz"
 
     total_reads = 0
     good_reads = 0
-    exclusion_counts_r1 = {k:0 for k in ["too_short","found_n","found_dot","found_homopolymer","low_score"]}
-    exclusion_counts_r2 = exclusion_counts_r1.copy()
 
-    with gzip.open(out_r1, "wt") as f_out1, gzip.open(out_r2, "wt") as f_out2:
-        with open(r1_path) as f1, open(r2_path) as f2:
-            r1_iter = FastqPhredIterator(f1)
-            r2_iter = FastqPhredIterator(f2)
-            for rec1, rec2 in zip(r1_iter, r2_iter):
+    with gzip.open(r1_out_path, "wt") as r1_out, gzip.open(r2_out_path, "wt") as r2_out:
+        with open(r1_path, "r") as r1_in, open(r2_path, "r") as r2_in:
+            r1_iterator = FastqPhredIterator(r1_in)
+            r2_iterator = FastqPhredIterator(r2_in)
+
+            for rec1, rec2 in tqdm(zip(r1_iterator, r2_iterator),
+                                   desc=f"Filtering {pair_name}", unit="reads"):
                 total_reads += 1
-                passes1, reasons1 = analyze_sequence(rec1)
-                passes2, reasons2 = analyze_sequence(rec2)
-
-                if passes1 and passes2:
+                keep1 = filter_sequence(rec1)
+                keep2 = filter_sequence(rec2)
+                if keep1 and keep2:
+                    SeqIO.write(rec1, r1_out, "fastq")
+                    SeqIO.write(rec2, r2_out, "fastq")
                     good_reads += 1
-                    SeqIO.write(rec1, f_out1, "fastq")
-                    SeqIO.write(rec2, f_out2, "fastq")
 
-                for k, v in reasons1.items():
-                    exclusion_counts_r1[k] += v
-                for k, v in reasons2.items():
-                    exclusion_counts_r2[k] += v
+    return {"file": pair_name, "total_reads": total_reads, "good_reads": good_reads}
 
-    return {
-        "file": base_name,
-        "total_reads": total_reads,
-        "good_reads": good_reads,
-        **{f"R1_{k}": v for k,v in exclusion_counts_r1.items()},
-        **{f"R2_{k}": v for k,v in exclusion_counts_r2.items()}
-    }
-
-
-# -------------------- Argument parser -------------------- #
-def parse_arguments():
-    global min_seq_len, homopolymer_coeff, min_score, seq_dir, output_dir, dryrun
-    parser = argparse.ArgumentParser(description="Paired-end FASTQ filter with .fastq.gz output")
-    parser.add_argument("-l", "--minlen", type=int, default=MIN_LENGTH_DEFAULT)
-    parser.add_argument("-p", "--homopolymerlen", type=int, default=HOMOPOLYMER_COEFF_DEFAULT)
-    parser.add_argument("-s", "--minscore", type=int, default=MIN_SCORE_DEFAULT)
-    parser.add_argument("-i", "--inputdir", type=str, required=True)
-    parser.add_argument("-o", "--outputdir", type=str)
-    parser.add_argument("--dryrun", action="store_true")
-    args = parser.parse_args()
-
-    min_seq_len = args.minlen
-    homopolymer_coeff = args.homopolymerlen
-    min_score = args.minscore
-    dryrun = args.dryrun
-    seq_dir = Path(args.inputdir)
-    output_dir = Path(args.outputdir) if args.outputdir else seq_dir / "fastfilter"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-
-# -------------------- Main -------------------- #
+# ---------------------
+# Main workflow
+# ---------------------
 def main():
-    start_time = time.time()
+    global seq_dir, output_dir
     parse_arguments()
 
-    fastq_r1_files = sorted(seq_dir.glob("*_R1_*.fastq"))
-    fastq_r2_files = sorted(seq_dir.glob("*_R2_*.fastq"))
-    paired_files = list(zip(fastq_r1_files, fastq_r2_files))
+    if seq_dir is None or not seq_dir.is_dir():
+        print(f"Input sequence directory not found: {seq_dir}")
+        sys.exit(1)
+    output_dir = output_dir or seq_dir.parent / "fastfilter"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if not paired_files:
-        raise ValueError("No paired-end FASTQ files found in input directory.")
+    # Find paired-end FASTQ files
+    r1_files = sorted(seq_dir.glob("*_R1_*.fastq"))
+    r2_files = sorted(seq_dir.glob("*_R2_*.fastq"))
+
+    if not r1_files or not r2_files or len(r1_files) != len(r2_files):
+        print("Error: Paired-end R1/R2 files not found or mismatch in counts.")
+        sys.exit(1)
+
+    pairs = list(zip(r1_files, r2_files))
 
     # Multiprocessing
-    pool = multiprocessing.Pool()
-    results = pool.starmap(parse_paired_file, paired_files)
-    pool.close()
-    pool.join()
+    with multiprocessing.Pool(processes=num_cpus) as pool:
+        results = pool.starmap(process_pair, pairs)
 
     # Write summary CSV
     summary_file = output_dir / "fastfilter_summary.csv"
-    with open(summary_file, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=results[0].keys())
-        writer.writeheader()
+    with open(summary_file, "w") as f:
+        f.write("file,total_reads,good_reads,pass_rate_pct\n")
         for r in results:
-            writer.writerow(r)
+            rate = (r["good_reads"] / r["total_reads"] * 100) if r["total_reads"] > 0 else 0
+            f.write(f"{r['file']},{r['total_reads']},{r['good_reads']},{rate:.1f}\n")
 
-    elapsed = (time.time() - start_time)/60
-    print(f"Filtering finished in {elapsed:.2f} min")
-    print(f"Summary saved to {summary_file}")
-
+    print(f"Filtering complete. Summary written to {summary_file}")
 
 if __name__ == "__main__":
     main()
