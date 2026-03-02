@@ -3,6 +3,7 @@
 """
 fastfilter_pe.py - Paired-end FASTQ filtering for STAR
 Optimized version with batch writing, dry-run support, and total reads pre-counting.
+TQDM bars now show commas and reads/s.
 """
 
 import argparse
@@ -19,7 +20,7 @@ import subprocess
 MIN_LENGTH_DEFAULT = 25
 HOMOPOLYMER_COEFF_DEFAULT = 25
 MIN_SCORE_DEFAULT = 30
-WRITE_BATCH_SIZE = 1000  # number of reads to write at once
+WRITE_BATCH_SIZE = 1000
 
 # Globals
 min_seq_len = MIN_LENGTH_DEFAULT
@@ -31,22 +32,17 @@ output_dir = None
 dryrun = False
 
 # ---------------------
-# Argument parsing
-# ---------------------
 def parse_arguments():
     global min_seq_len, homopolymer_coeff, min_score, seq_dir, output_dir, num_cpus, dryrun
 
     parser = argparse.ArgumentParser(description="Paired-end FASTQ filtering for STAR.")
-    parser.add_argument("-l", "--minlen", type=int, default=MIN_LENGTH_DEFAULT,
-                        help="Minimum sequence length")
-    parser.add_argument("-p", "--homopolymerlen", type=int, default=HOMOPOLYMER_COEFF_DEFAULT,
-                        help="Length threshold for homopolymers")
-    parser.add_argument("-s", "--min-score", type=int, default=MIN_SCORE_DEFAULT,
-                        help="Minimum average Phred quality score")
-    parser.add_argument("-i", "--seq-dir", type=str, help="Input directory containing cutadapt FASTQ files")
-    parser.add_argument("-o", "--output-dir", type=str, help="Directory to save filtered FASTQ files")
-    parser.add_argument("-j", "--cpus", type=int, default=1, help="Number of parallel CPUs")
-    parser.add_argument("--dryrun", action="store_true", help="Do not write output files, only simulate filtering")
+    parser.add_argument("-l", "--minlen", type=int, default=MIN_LENGTH_DEFAULT)
+    parser.add_argument("-p", "--homopolymerlen", type=int, default=HOMOPOLYMER_COEFF_DEFAULT)
+    parser.add_argument("-s", "--min-score", type=int, default=MIN_SCORE_DEFAULT)
+    parser.add_argument("-i", "--seq-dir", type=str)
+    parser.add_argument("-o", "--output-dir", type=str)
+    parser.add_argument("-j", "--cpus", type=int, default=1)
+    parser.add_argument("--dryrun", action="store_true")
 
     args = parser.parse_args()
     min_seq_len = args.minlen
@@ -58,39 +54,27 @@ def parse_arguments():
     dryrun = args.dryrun
 
 # ---------------------
-# Homopolymer detection
-# ---------------------
 def find_homopolymers(seq):
     return any(seq.count(nt * homopolymer_coeff) > 0 for nt in "ATGC")
 
-# ---------------------
-# Sequence filter
 # ---------------------
 def filter_sequence(record):
     seq = record.seq
     qual = record.letter_annotations.get("phred_quality", [])
     avg_qual = sum(qual) / len(qual) if qual else 0
-
-    if len(seq) < min_seq_len:
-        return False
-    if "N" in seq or "." in seq:
-        return False
-    if find_homopolymers(seq):
-        return False
-    if avg_qual < min_score:
-        return False
+    if len(seq) < min_seq_len: return False
+    if "N" in seq or "." in seq: return False
+    if find_homopolymers(seq): return False
+    if avg_qual < min_score: return False
     return True
 
-# ---------------------
-# Process paired-end file with pre-counted total reads
 # ---------------------
 def process_pair(r1_path: Path, r2_path: Path, position: int):
     pair_name = r1_path.stem.replace("_R1", "")
     r1_tmp = output_dir / f"{pair_name}_R1_FILTERED.fastq"
     r2_tmp = output_dir / f"{pair_name}_R2_FILTERED.fastq"
 
-    # 1️⃣ Count total reads first
-    print(f"[{pair_name}] Counting total reads...")
+    # Open function depending on gzip or not
     if r1_path.suffix == ".gz":
         open_func = gzip.open
         mode = "rt"
@@ -98,54 +82,56 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
         open_func = open
         mode = "r"
 
+    # 1️⃣ Count total reads
     total_lines = 0
     with open_func(r1_path, mode) as f:
-        for _ in tqdm(f, desc=f"{pair_name} counting reads", unit="lines", position=position, leave=True, dynamic_ncols=True):
+        for _ in tqdm(f,
+                      desc=f"{pair_name} counting reads",
+                      unit="lines",
+                      position=position,
+                      leave=True,
+                      dynamic_ncols=True,
+                      bar_format="{n:,} lines counted | {rate_fmt}"):
             total_lines += 1
     total_reads = total_lines // 4
-    print(f"[{pair_name}] Total reads: {total_reads:,}")
-    bar_format_str = f"{{n:,}}/{total_reads:,} reads processed"
-    
+
+    # Bar format for filtering
+    bar_format_str = f"{{n:,}}/{total_reads:,} reads processed | {{rate_fmt}}"
+
     good_reads = 0
-    r1_buffer = []
-    r2_buffer = []
+    r1_buffer, r2_buffer = [], []
 
     # 2️⃣ Filter reads
     with open_func(r1_path, mode) as r1_in, open_func(r2_path, mode) as r2_in:
         r1_iterator = FastqPhredIterator(r1_in)
         r2_iterator = FastqPhredIterator(r2_in)
 
-        for rec1, rec2 in tqdm(zip(r1_iterator, r2_iterator),
-                               desc=f"{pair_name}",
-                               total=None,
-                               unit="reads",
-                               position=position,
-                               leave=True,
-                               bar_format=bar_format_str,
-                               dynamic_ncols=True):
+        with tqdm(zip(r1_iterator, r2_iterator),
+                  total=None,  # avoid tqdm recalculating
+                  unit="reads",
+                  position=position,
+                  leave=True,
+                  dynamic_ncols=True,
+                  bar_format=bar_format_str) as pbar:
 
-            keep1 = filter_sequence(rec1)
-            keep2 = filter_sequence(rec2)
+            for rec1, rec2 in pbar:
+                keep1 = filter_sequence(rec1)
+                keep2 = filter_sequence(rec2)
+                if keep1 and keep2:
+                    good_reads += 1
+                    if not dryrun:
+                        r1_buffer.append(rec1)
+                        r2_buffer.append(rec2)
+                if not dryrun and len(r1_buffer) >= WRITE_BATCH_SIZE:
+                    SeqIO.write(r1_buffer, r1_tmp, "fastq") if r1_buffer else None
+                    SeqIO.write(r2_buffer, r2_tmp, "fastq") if r2_buffer else None
+                    r1_buffer.clear()
+                    r2_buffer.clear()
 
-            if keep1 and keep2:
-                good_reads += 1
-                if not dryrun:
-                    r1_buffer.append(rec1)
-                    r2_buffer.append(rec2)
-
-            # Write in batches
-            if not dryrun and len(r1_buffer) >= WRITE_BATCH_SIZE:
-                SeqIO.write(r1_buffer, r1_tmp, "fastq") if r1_buffer else None
-                SeqIO.write(r2_buffer, r2_tmp, "fastq") if r2_buffer else None
-                r1_buffer.clear()
-                r2_buffer.clear()
-
-    # Write remaining reads
     if not dryrun and r1_buffer:
         SeqIO.write(r1_buffer, r1_tmp, "fastq")
         SeqIO.write(r2_buffer, r2_tmp, "fastq")
 
-    # Compress files at the end
     if not dryrun:
         for tmp in [r1_tmp, r2_tmp]:
             subprocess.run(["gzip", "-f", str(tmp)])
@@ -153,19 +139,16 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
     return {"file": pair_name, "total_reads": total_reads, "good_reads": good_reads}
 
 # ---------------------
-# Main workflow
-# ---------------------
 def main():
     global seq_dir, output_dir
     parse_arguments()
-
     if seq_dir is None or not seq_dir.is_dir():
         print(f"Input sequence directory not found: {seq_dir}")
         sys.exit(1)
+
     output_dir = output_dir or seq_dir.parent / "fastfilter"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find paired-end FASTQ files
     r1_files = sorted(seq_dir.glob("*_R1_*.fastq*"))
     r2_files = sorted(seq_dir.glob("*_R2_*.fastq*"))
 
@@ -174,14 +157,13 @@ def main():
         sys.exit(1)
 
     pairs = list(zip(r1_files, r2_files))
-    positions = list(range(len(pairs)))  # for stacked progress bars
+    positions = list(range(len(pairs)))
 
-    # Multiprocessing
     pool_args = [(r1, r2, pos) for (r1, r2), pos in zip(pairs, positions)]
     with multiprocessing.Pool(processes=num_cpus) as pool:
         results = pool.starmap(process_pair, pool_args)
 
-    # Write summary CSV with pass rate
+    # Write summary CSV with total reads
     summary_file = output_dir / "fastfilter_summary.csv"
     with open(summary_file, "w") as f:
         f.write("file,total_reads,good_reads,pass_rate_pct\n")
