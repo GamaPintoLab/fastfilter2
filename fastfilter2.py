@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-FastFilter: Threaded paired-end FASTQ filter for STAR
+FastFilter2: Threaded paired-end FASTQ filter for STAR
 Author: Lucas Monteiro | PI: Margarida Gama-Carvalho
 RNA Systems Biology Lab, BioISI, University of Lisbon
 
