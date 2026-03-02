@@ -104,7 +104,8 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
             total_lines += 1
     total_reads = total_lines // 4
     print(f"[{pair_name}] Total reads: {total_reads:,}")
-
+    bar_format_str = f"{{n:,}}/{total_reads:,} reads processed"
+    
     good_reads = 0
     r1_buffer = []
     r2_buffer = []
@@ -116,10 +117,11 @@ def process_pair(r1_path: Path, r2_path: Path, position: int):
 
         for rec1, rec2 in tqdm(zip(r1_iterator, r2_iterator),
                                desc=f"{pair_name}",
-                               total=total_reads,
+                               total=None,
                                unit="reads",
                                position=position,
                                leave=True,
+                               bar_format=bar_format_str,
                                dynamic_ncols=True):
 
             keep1 = filter_sequence(rec1)
